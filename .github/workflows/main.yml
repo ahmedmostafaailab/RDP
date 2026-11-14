@@ -1,5 +1,5 @@
 
-name: Secure Windows RDP + Tailscale V2
+name: Secure Windows RDP + Tailscale V3
 
 on:
   workflow_dispatch:
@@ -17,8 +17,12 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      # STEP 1: Secure Windows configuration
-      - name: Configure Secure RDP User
+
+      # ==========================================
+      # 1. CONFIGURE WINDOWS AND RDP ACCOUNT
+      # ==========================================
+
+      - name: Configure Secure Windows RDP
         shell: pwsh
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
@@ -32,18 +36,26 @@ jobs:
           }
 
           if ($env:RDP_PASSWORD.Length -lt 16) {
-            throw "RDP password must contain at least 16 characters."
+            throw "RDP password must be at least 16 characters."
           }
+
+          # Record job start time
+          $started = [DateTime]::UtcNow.ToString("o")
+
+          Add-Content `
+            -Path $env:GITHUB_ENV `
+            -Value "JOB_STARTED_UTC=$started"
 
           $securePassword = ConvertTo-SecureString `
             $env:RDP_PASSWORD -AsPlainText -Force
 
-          # Create or update dedicated RDP account
+          # Create or update RDP account
           $user = Get-LocalUser -Name "RDP" `
             -ErrorAction SilentlyContinue
 
           if ($user) {
-            Set-LocalUser -Name "RDP" `
+            Set-LocalUser `
+              -Name "RDP" `
               -Password $securePassword
           }
           else {
@@ -51,42 +63,56 @@ jobs:
               -Name "RDP" `
               -Password $securePassword `
               -AccountNeverExpires `
-              -Description "Temporary remote development user"
+              -Description "Temporary development user"
           }
 
           Enable-LocalUser -Name "RDP"
 
-          # Allow RDP login without administrator privileges
-          $members = Get-LocalGroupMember `
-            -Group "Remote Desktop Users"
+          # Grant remote desktop access
+          $rdpGroup = Get-LocalGroup `
+            -SID "S-1-5-32-555"
 
-          $accountName = "$env:COMPUTERNAME\RDP"
+          $members = Get-LocalGroupMember `
+            -Group $rdpGroup.Name
+
+          $account = "$env:COMPUTERNAME\RDP"
 
           if (-not ($members | Where-Object {
-            $_.Name -eq $accountName
+            $_.Name -eq $account
           })) {
             Add-LocalGroupMember `
-              -Group "Remote Desktop Users" `
+              -Group $rdpGroup.Name `
               -Member "RDP"
           }
 
-          # Disable broad built-in RDP firewall rules
+          # Make sure RDP is not an administrator
+          $adminGroup = Get-LocalGroup `
+            -SID "S-1-5-32-544"
+
+          $adminMembers = Get-LocalGroupMember `
+            -Group $adminGroup.Name
+
+          if ($adminMembers | Where-Object {
+            $_.Name -eq $account
+          }) {
+            Remove-LocalGroupMember `
+              -Group $adminGroup.Name `
+              -Member "RDP"
+          }
+
+          # Disable broad RDP firewall rules
           Get-NetFirewallRule `
             -DisplayGroup "Remote Desktop" `
             -ErrorAction SilentlyContinue |
             Disable-NetFirewallRule
 
-          # Record job start for controlled shutdown
-          $started = (Get-Date).ToUniversalTime().ToString("o")
-
-          Add-Content `
-            -Path $env:GITHUB_ENV `
-            -Value "JOB_STARTED_UTC=$started"
-
           Write-Host "RDP user configured."
-          Write-Host "Password is stored in GitHub Secrets."
+          Write-Host "Password protected by GitHub Secrets."
 
-      # STEP 2: Connect to Tailscale
+      # ==========================================
+      # 2. INSTALL AND CONNECT TAILSCALE
+      # ==========================================
+
       - name: Connect Tailscale
         uses: tailscale/github-action@v4
         with:
@@ -94,30 +120,111 @@ jobs:
           hostname: gh-dev-${{ github.run_id }}
           version: latest
 
-      # STEP 3: Secure firewall and enable RDP
+      # ==========================================
+      # 3. GET TAILSCALE IP WITH RETRIES
+      # ==========================================
+
       - name: Configure Private RDP Access
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "=== CHECKING TAILSCALE ==="
+          Write-Host "=== TAILSCALE DIAGNOSTICS ==="
 
-          $ts = Join-Path $env:ProgramFiles `
-            "Tailscale\tailscale.exe"
+          # Find Tailscale executable
+          $tsCommand = Get-Command tailscale.exe `
+            -ErrorAction SilentlyContinue
+
+          if ($tsCommand) {
+            $ts = $tsCommand.Source
+          }
+          else {
+            $ts = Join-Path `
+              $env:ProgramFiles `
+              "Tailscale\tailscale.exe"
+          }
 
           if (-not (Test-Path $ts)) {
-            $ts = (Get-Command tailscale.exe `
-              -ErrorAction Stop).Source
+            throw "Tailscale executable not found."
           }
 
-          $tsIP = (& $ts ip -4 | Select-Object -First 1)
+          Write-Host "Tailscale executable: $ts"
 
-          if ($LASTEXITCODE -ne 0 -or
-              [string]::IsNullOrWhiteSpace($tsIP)) {
-            throw "Tailscale IP unavailable."
+          # Enable unattended networking where supported
+          try {
+            & $ts set --unattended=true
+
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "Could not enable unattended mode."
+            }
+          }
+          catch {
+            Write-Warning "Unattended mode unavailable."
           }
 
-          $tsIP = $tsIP.Trim()
+          # Retrieve IPv4 from structured status
+          $tsIP = $null
+
+          for ($attempt = 1; $attempt -le 15; $attempt++) {
+
+            Write-Host "Checking Tailscale - attempt $attempt/15"
+
+            try {
+              $rawStatus = & $ts status --json
+
+              if ($LASTEXITCODE -eq 0 -and $rawStatus) {
+
+                $status = $rawStatus | ConvertFrom-Json
+
+                Write-Host "Backend State: $($status.BackendState)"
+
+                $tsIP = @($status.Self.TailscaleIPs) |
+                  Where-Object {
+                    $_ -is [string] -and $_ -match '^100\.'
+                  } |
+                  Select-Object -First 1
+              }
+
+              # Fallback to standard CLI
+              if (-not $tsIP) {
+                $result = & $ts ip -4 2>$null
+
+                if ($LASTEXITCODE -eq 0) {
+                  $tsIP = @($result) |
+                    Where-Object {
+                      $_ -is [string] -and $_ -match '^100\.'
+                    } |
+                    Select-Object -First 1
+                }
+              }
+
+              if ($tsIP) {
+                $tsIP = $tsIP.Trim()
+                break
+              }
+            }
+            catch {
+              Write-Warning "IP check failed: $($_.Exception.Message)"
+            }
+
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $tsIP) {
+            Write-Host "=== FINAL TAILSCALE STATUS ==="
+
+            & $ts status
+
+            throw "Tailscale IPv4 unavailable after retries."
+          }
+
+          Write-Host "SUCCESS: Tailscale IP = $tsIP"
+
+          # ======================================
+          # 4. CONFIGURE PRIVATE FIREWALL
+          # ======================================
+
+          Write-Host "=== CONFIGURING FIREWALL ==="
 
           $adapter = Get-NetAdapter |
             Where-Object {
@@ -127,12 +234,20 @@ jobs:
             Select-Object -First 1
 
           if (-not $adapter) {
-            throw "Tailscale network adapter not found."
+            Write-Host "Available network adapters:"
+            Get-NetAdapter |
+              Select-Object Name, InterfaceDescription
+
+            throw "Tailscale adapter not found."
           }
 
-          Write-Host "Tailscale connected: $tsIP"
+          # Remove duplicate custom rule if present
+          Get-NetFirewallRule `
+            -DisplayName "RDP-Tailscale-Only" `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
 
-          # Create a narrow inbound firewall rule
+          # Allow RDP only through Tailscale
           New-NetFirewallRule `
             -DisplayName "RDP-Tailscale-Only" `
             -Direction Inbound `
@@ -145,23 +260,31 @@ jobs:
             -InterfaceAlias $adapter.Name `
             -Profile Any | Out-Null
 
-          # Windows Remote Desktop configuration
+          Write-Host "Private firewall rule created."
+
+          # ======================================
+          # 5. ENABLE SECURE REMOTE DESKTOP
+          # ======================================
+
+          Write-Host "=== CONFIGURING RDP ==="
+
           $serverPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
 
           $rdpPath = "$serverPath\WinStations\RDP-Tcp"
 
+          # Enable Remote Desktop
           Set-ItemProperty `
             -Path $serverPath `
             -Name "fDenyTSConnections" `
             -Value 0
 
-          # Require Network Level Authentication
+          # Enable Network Level Authentication
           Set-ItemProperty `
             -Path $rdpPath `
             -Name "UserAuthentication" `
             -Value 1
 
-          # Require TLS security layer
+          # Require TLS
           Set-ItemProperty `
             -Path $rdpPath `
             -Name "SecurityLayer" `
@@ -177,53 +300,62 @@ jobs:
 
           Start-Sleep -Seconds 5
 
-          # Verify local RDP listener
+          # Verify listening port
           $listener = Get-NetTCPConnection `
             -LocalPort 3389 `
             -State Listen `
             -ErrorAction SilentlyContinue
 
           if (-not $listener) {
-            throw "RDP service is not listening on TCP 3389."
+            throw "RDP not listening on port 3389."
           }
 
+          Write-Host "RDP listener verified."
+
+          # ======================================
+          # 6. DISPLAY CONNECTION INFORMATION
+          # ======================================
+
           Write-Host ""
-          Write-Host "======================================"
-          Write-Host "RDP CONFIGURATION READY"
-          Write-Host "======================================"
-          Write-Host "Computer: $tsIP"
-          Write-Host "Username: .\RDP"
-          Write-Host "Port: 3389"
-          Write-Host "Password: Stored in GitHub Secrets"
-          Write-Host "======================================"
+          Write-Host "===================================="
+          Write-Host "        RDP CONNECTION READY"
+          Write-Host "===================================="
+          Write-Host "Computer : $tsIP"
+          Write-Host "Username : .\RDP"
+          Write-Host "Port     : 3389"
+          Write-Host "Password : GitHub Secret"
+          Write-Host "===================================="
+          Write-Host ""
 
-          # Store non-sensitive connection details
-          Add-Content `
-            -Path $env:GITHUB_STEP_SUMMARY `
-            -Value "### Remote development connection"
+          # Save non-sensitive connection details
+          @(
+            "## Secure Windows RDP"
+            ""
+            "**Tailscale IP:** $tsIP"
+            ""
+            "**Username:** ``.\RDP``"
+            ""
+            "**Port:** 3389"
+            ""
+            "**Status:** RDP listener verified"
+          ) | Out-File `
+            -FilePath $env:GITHUB_STEP_SUMMARY `
+            -Encoding utf8 `
+            -Append
 
-          Add-Content `
-            -Path $env:GITHUB_STEP_SUMMARY `
-            -Value "Tailscale IP: $tsIP"
+      # ==========================================
+      # 7. SYSTEM DIAGNOSTICS
+      # ==========================================
 
-          Add-Content `
-            -Path $env:GITHUB_STEP_SUMMARY `
-            -Value "Username: .\RDP"
-
-          Add-Content `
-            -Path $env:GITHUB_STEP_SUMMARY `
-            -Value "RDP Port: 3389"
-
-      # STEP 4: Diagnostics
       - name: System Diagnostics
         shell: pwsh
         run: |
-          Write-Host "=== WINDOWS VERSION ==="
+          Write-Host "=== WINDOWS ==="
 
           Get-CimInstance Win32_OperatingSystem |
             Select-Object Caption, Version
 
-          Write-Host "=== CPU ==="
+          Write-Host "=== PROCESSOR ==="
 
           Get-CimInstance Win32_Processor |
             Select-Object Name, NumberOfLogicalProcessors
@@ -237,16 +369,19 @@ jobs:
 
           Get-PSDrive C
 
-          Write-Host "=== RDP STATUS ==="
+          Write-Host "=== RDP SERVICE ==="
 
           Get-Service TermService
 
-          Write-Host "=== FIREWALL RULE ==="
+          Write-Host "=== FIREWALL ==="
 
           Get-NetFirewallRule `
             -DisplayName "RDP-Tailscale-Only"
 
-      # STEP 5: Controlled session for debugging
+      # ==========================================
+      # 8. KEEP DEVELOPMENT SESSION ACTIVE
+      # ==========================================
+
       - name: Maintain Development Session
         shell: pwsh
         run: |
@@ -256,44 +391,54 @@ jobs:
             $env:JOB_STARTED_UTC
           ).ToUniversalTime()
 
-          # Leave time before the GitHub job limit
+          # End before GitHub's hard job timeout
           $deadline = $started.AddMinutes(335)
 
           $warned = $false
           $lastLog = [datetime]::MinValue
 
           Write-Host "Development session active."
+          Write-Host "Save work externally before shutdown."
 
           while ((Get-Date).ToUniversalTime() -lt $deadline) {
 
             $now = (Get-Date).ToUniversalTime()
+
             $remaining = $deadline - $now
 
             # Check RDP service health
             $service = Get-Service `
-              -Name "TermService" `
-              -ErrorAction Stop
+              -Name "TermService"
 
             if ($service.Status -ne "Running") {
-              Write-Warning "RDP service stopped. Restarting..."
+              Write-Warning "RDP service stopped."
+
               Start-Service -Name "TermService"
             }
 
-            # Warn before session shutdown
+            # Warning in GitHub Actions logs
             if (-not $warned -and
                 $remaining.TotalMinutes -le 20) {
-              Write-Warning "Approximately 20 minutes remaining."
-              Write-Warning "Save your development work externally."
+
+              Write-Warning "20 minutes remaining."
+              Write-Warning "Save your files externally."
+
               $warned = $true
             }
 
-            # Write health log every ten minutes
+            # Report status every ten minutes
             if (($now - $lastLog).TotalMinutes -ge 10) {
-              Write-Host "RDP running - $([math]::Ceiling($remaining.TotalMinutes)) minutes remaining."
+
+              $minutes = [math]::Ceiling(
+                $remaining.TotalMinutes
+              )
+
+              Write-Host "RDP Active | Remaining: $minutes min"
+
               $lastLog = $now
             }
 
             Start-Sleep -Seconds 60
           }
 
-          Write-Host "Debugging session finished."
+          Write-Host "Development session finished."
